@@ -1,5 +1,7 @@
 import { VerilogXMLParser } from '../sim/vxmlparser';
 import { ErrorParser } from './ErrorParser';
+import verilatedStd from './verilated_std.sv?raw';
+import verilatedStdWaiver from './verilated_std_waiver.vlt?raw';
 import verilator_bin from './verilator_bin';
 
 let browserWasmBin: ArrayBuffer | null = null;
@@ -22,7 +24,7 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   const errorParser = new ErrorParser();
 
-  const verilatorInst = verilator_bin({
+  const verilatorInst = await verilator_bin({
     wasmBinary,
     noInitialRun: true,
     noExitRuntime: true,
@@ -32,8 +34,24 @@ export async function compileVerilator(opts: ICompileOptions) {
       errorParser.feedLine(message);
     },
   });
-  await verilatorInst.ready;
   const { FS } = verilatorInst;
+
+  // Verilator 5.x looks up its built-in package and lint waiver files
+  // at /share/share/verilator/include relative to its --prefix.
+  for (const dir of [
+    '/share',
+    '/share/share',
+    '/share/share/verilator',
+    '/share/share/verilator/include',
+  ]) {
+    try {
+      FS.mkdir(dir);
+    } catch {
+      // already exists
+    }
+  }
+  FS.writeFile('/share/share/verilator/include/verilated_std.sv', verilatedStd);
+  FS.writeFile('/share/share/verilator/include/verilated_std_waiver.vlt', verilatedStdWaiver);
 
   let sourceList: string[] = [];
   FS.mkdir('src');
