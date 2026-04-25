@@ -458,8 +458,24 @@ export class HDLModuleWASM implements HDLModuleRunner {
 
   private genFuncs() {
     // function type (dsegptr)
+    const generatedFuncNames = new Set<string>();
     for (var block of this.hdlmod.blocks) {
       this.genFunction(block);
+      if (block.name) generatedFuncNames.add(block.name);
+    }
+    // Verilator >=4.210 folded the per-iteration change-detect logic into
+    // _eval and stopped emitting a separate _change_request cfunc. Our tick
+    // loop still calls it, so synthesize a stub that always reports
+    // "converged" (returns 0) when the front end didn't supply one.
+    if (!generatedFuncNames.has('_change_request')) {
+      const fsig = binaryen.createType([binaryen.i32]);
+      this.bmod.addFunction(
+        '_change_request',
+        fsig,
+        binaryen.i32,
+        [],
+        this.bmod.return(this.bmod.i32.const(0)),
+      );
     }
     // export functions
     for (var fname of VERILATOR_UNIT_FUNCTIONS) {

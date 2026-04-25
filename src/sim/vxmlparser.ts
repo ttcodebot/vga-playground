@@ -131,9 +131,15 @@ export class VerilogXMLParser implements HDLUnit {
   }
 
   open_module(node: XMLNode) {
+    // Verilator >=4.210 renamed the auto-generated $root wrapper module
+    // (formerly "TOP", see verilator/verilator#3036). Downstream code in
+    // hdlwasm and the integration tests still looks up modules['TOP'], so
+    // collapse "$root" back to "TOP" here.
+    let name = node.attrs['name'];
+    if (name === '$root') name = 'TOP';
     const module: HDLModuleDef = {
       $loc: this.parseSourceLocation(node),
-      name: node.attrs['name'],
+      name,
       origName: node.attrs['origName'],
       blocks: [],
       instances: [],
@@ -178,6 +184,8 @@ export class VerilogXMLParser implements HDLUnit {
   }
 
   resolveModule(s: string): HDLModuleDef {
+    // See open_module: Verilator >=4.210 renamed the wrapper module to $root.
+    if (s === '$root') s = 'TOP';
     const mod = this.modules[s];
     if (mod == null) throw new CompileError(this.cur_loc, `could not resolve module "${s}"`);
     return mod;
