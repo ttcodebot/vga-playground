@@ -69,6 +69,7 @@ export async function compileVerilator(opts: ICompileOptions) {
       '--cc',
       '-O3',
       '-Wall',
+      '-Wno-fatal',
       '-Wno-EOFNEWLINE',
       '-Wno-DECLFILENAME',
       '--x-assign',
