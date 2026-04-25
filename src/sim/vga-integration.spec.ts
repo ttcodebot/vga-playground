@@ -115,4 +115,49 @@ describe('VGA Integration', () => {
     const ref = decodePNG(readFileSync(refPath));
     expect(Buffer.from(pixels).equals(Buffer.from(ref.data))).toBe(true);
   });
+
+  // End-to-end smoke test using a real Tiny Tapeout design
+  // (johshoff/ttsky-26a, top module tt_um_johshoff_metaballs). We don't
+  // ship a reference frame for it — just verify it compiles, simulates
+  // through a non-trivial run, and drives a non-zero uo_out (i.e. the
+  // VGA pipeline produces something).
+  test('johshoff/ttsky-26a metaballs compiles, simulates, and drives uo_out', async () => {
+    const fixtureDir = resolve(__dirname, '__fixtures__/johshoff_ttsky26a');
+    const res = await compileVerilator({
+      topModule: 'tt_um_johshoff_metaballs',
+      sources: {
+        'project.v': readFileSync(resolve(fixtureDir, 'project.v'), 'utf8'),
+        'metaballs.v': readFileSync(resolve(fixtureDir, 'metaballs.v'), 'utf8'),
+      },
+      wasmBinary: verilatorWasmBinary,
+    });
+    if (!res.output) {
+      throw new Error(`Compilation failed: ${res.errors.map((e) => e.message).join('\n')}`);
+    }
+    const constpool = res.output.modules['@CONST-POOL@'] || res.output.modules['__Vconst'];
+    const mod = new HDLModuleWASM(res.output.modules['TOP'], constpool);
+    await mod.init();
+    resetModule(mod);
+
+    const uo_out_offset = mod.globals.lookup('uo_out').offset;
+    let nonZeroSeen = false;
+    const differentValuesSeen = new Set<number>();
+    // 800x600 @ 72Hz with a 50 MHz pixel clock means ~52 µs / line. At
+    // ~31 ns / tick that's ~1700 ticks per scanline, ~1.1M ticks per
+    // frame; 200k ticks gets us through several horizontal periods which
+    // is plenty for hsync to pulse and the metaballs pixel-rgb to vary.
+    for (let i = 0; i < 200_000; i++) {
+      mod.tick2(1);
+      const v = mod.data8[uo_out_offset];
+      if (v !== 0) nonZeroSeen = true;
+      differentValuesSeen.add(v);
+    }
+    expect(nonZeroSeen).toBe(true);
+    // Sanity check: across 200k ticks a working VGA pipeline must drive
+    // uo_out through more than just one steady state. Even a sync-only
+    // signal toggles, so we expect >= 3 distinct byte values (hsync edges,
+    // visible-area fill, etc.).
+    expect(differentValuesSeen.size).toBeGreaterThanOrEqual(3);
+    mod.dispose();
+  }, 60000);
 });
