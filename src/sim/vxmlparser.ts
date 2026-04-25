@@ -291,9 +291,14 @@ export class VerilogXMLParser implements HDLUnit {
       name,
       exprs,
     });
+    // For stl/ico we strip the outer `if (__V*Triggered[0] & 1)` guard
+    // because we'll always run those bodies (they're combinational settle
+    // logic). For nba we keep the per-block trigger guards: each block
+    // there is gated on a specific bit-mask of __VnbaTriggered[0] that
+    // identifies which clock-like signal must have edged for it to fire.
     const stlBody = unwrapTriggerGate(stlBlocks);
     const icoBody = unwrapTriggerGate(icoBlocks);
-    const nbaBody = unwrapTriggerGate(nbaBlocks);
+    const nbaBody = nbaBlocks.flatMap((b) => b.exprs);
     const initialBody = initialBlocks.flatMap((b) => b.exprs);
     // Now that we've harvested their bodies, drop the V5 region cfuncs from
     // mod.blocks. The `_*_sequent__*` / `_*_comb__*` cfuncs remain so any
@@ -324,44 +329,120 @@ export class VerilogXMLParser implements HDLUnit {
     const nbaBodyNoVars = splitVars(nbaBody);
     const initialBodyNoVars = splitVars(initialBody);
     const hoistedVars = Array.from(hoistedVarsMap.values());
-    const clkPrev = this.findClkTriggerPrevVar(mod);
-    let evalNbaStmts: HDLExpr[] = nbaBodyNoVars;
-    if (nbaBodyNoVars.length > 0 && clkPrev) {
-      // Placeholders we'll mutate via defer().
-      const clkRef: HDLVarRef = { refname: 'clk', dtype: null! };
-      const prevRef: HDLVarRef = { refname: clkPrev, dtype: null! };
-      const notNode: HDLUnop = { op: 'not', dtype: null!, left: prevRef };
-      const cond: HDLBinop = { op: 'and', dtype: null!, left: clkRef, right: notNode };
-      const updatePrev: HDLBinop = {
+    // Verilator 5.x's `_eval_nba` body keeps per-block trigger gates of the
+    // form `if (__VnbaTriggered[0] & <bitmask>) { ... }`. The bitmask
+    // identifies which subset of clock-like signals (clk / vsync / async
+    // reset / etc.) must have edged for that block to fire. We can't drop
+    // those gates without re-deriving the bit→signal mapping, so instead
+    // we keep the gates intact and call the V5 trigger helpers to populate
+    // `__VactTriggered` / `__VnbaTriggered` correctly.
+    //
+    // Schedule one phase of the V5 active+NBA loop:
+    //   _eval_triggers__act();        // computes __VactTriggered, updates prev_*
+    //   __VnbaTriggered[0] |= __VactTriggered[0];   // (via _trigger_orInto__act)
+    //   if (__VnbaTriggered[0] != 0) { _eval_nba body }
+    //   __VnbaTriggered[0] = 0;       // (via _trigger_clear__act)
+    //
+    // We unwrap the original _eval_nba body's outer trigger guard (if any)
+    // because `_eval_nba` itself just wraps everything in
+    // `if (__VnbaTriggered[0] != 0) ...` which we re-add explicitly.
+    let evalNbaStmts: HDLExpr[] = [];
+    if (nbaBodyNoVars.length > 0) {
+      const evalTriggersCall: HDLFuncCall = {
+        funcname: '_eval_triggers__act',
+        dtype: null!,
+        args: [],
+      };
+      // Inline the orInto: __VnbaTriggered[0] |= __VactTriggered[0].
+      const nbaTrigRef: HDLVarRef = { refname: '__VnbaTriggered', dtype: null! };
+      const actTrigRef: HDLVarRef = { refname: '__VactTriggered', dtype: null! };
+      const zeroIdx0: HDLConstant = { cvalue: 0, bigvalue: null!, dtype: null!, origWidth: 32 };
+      const zeroIdx1: HDLConstant = { cvalue: 0, bigvalue: null!, dtype: null!, origWidth: 32 };
+      const zeroIdx2: HDLConstant = { cvalue: 0, bigvalue: null!, dtype: null!, origWidth: 32 };
+      const zeroIdx3: HDLConstant = { cvalue: 0, bigvalue: null!, dtype: null!, origWidth: 32 };
+      const nbaSel: HDLBinop = {
+        op: 'arraysel',
+        dtype: null!,
+        left: nbaTrigRef,
+        right: zeroIdx0,
+      };
+      const actSel: HDLBinop = {
+        op: 'arraysel',
+        dtype: null!,
+        left: actTrigRef,
+        right: zeroIdx1,
+      };
+      const orVal: HDLBinop = {
+        op: 'or',
+        dtype: null!,
+        left: nbaSel,
+        right: actSel,
+      };
+      const nbaSelDest: HDLBinop = {
+        op: 'arraysel',
+        dtype: null!,
+        left: { refname: '__VnbaTriggered', dtype: null! } as HDLVarRef,
+        right: zeroIdx2,
+      };
+      const orInto: HDLBinop = {
         op: 'assign',
         dtype: null!,
-        // V5/V4 convention: <assign> child[0]=src, child[1]=dest, so
-        // `left=clk` (src) and `right=prev` (dest).
-        left: clkRef,
-        right: prevRef,
+        // <assign>: left=src, right=dest
+        left: orVal,
+        right: nbaSelDest,
       };
-      // defer2 runs AFTER the deferDataType() calls registered via defer(),
-      // so by the time we sample mod.vardefs[*].dtype it is populated.
-      this.defer2(() => {
-        clkRef.dtype = mod.vardefs['clk'].dtype;
-        prevRef.dtype = mod.vardefs[clkPrev].dtype;
-        notNode.dtype = prevRef.dtype;
-        cond.dtype = clkRef.dtype;
-        updatePrev.dtype = clkRef.dtype;
-      });
-      const ifBlock: HDLTriop = {
-        op: 'if',
+      // Clear: __VnbaTriggered[0] = 0
+      const clearZero: HDLConstant = {
+        cvalue: 0,
+        bigvalue: 0n,
         dtype: null!,
-        cond,
-        left: mkBlock(null!, [...nbaBodyNoVars]),
-        right: null!,
+        origWidth: 64,
       };
-      // Update the prev tracker UNCONDITIONALLY at the end (after firing the
-      // body), to mirror Verilator's `_eval_triggers__act` which always
-      // assigns `prev = clk` regardless of whether the edge fired. Without
-      // this the prev tracker would only update on rising edges and a
-      // subsequent rising edge (after a fall) would never re-fire.
-      evalNbaStmts = [ifBlock as unknown as HDLExpr, updatePrev as unknown as HDLExpr];
+      const nbaSelClear: HDLBinop = {
+        op: 'arraysel',
+        dtype: null!,
+        left: { refname: '__VnbaTriggered', dtype: null! } as HDLVarRef,
+        right: zeroIdx3,
+      };
+      const clear: HDLBinop = {
+        op: 'assign',
+        dtype: null!,
+        left: clearZero,
+        right: nbaSelClear,
+      };
+      // Wire dtypes. `__VnbaTriggered` is `bit[63:0] [0:0]` (an unpacked
+      // array of one 64-bit chunk). `__VactTriggered` matches.
+      this.defer2(() => {
+        const nbaDt = mod.vardefs['__VnbaTriggered']?.dtype;
+        const actDt = mod.vardefs['__VactTriggered']?.dtype;
+        const idxDt = this.dtypes['IData'];
+        const elemDt = nbaDt && (nbaDt as HDLUnpackArray).subtype;
+        if (!nbaDt || !actDt || !elemDt) return;
+        nbaTrigRef.dtype = nbaDt;
+        actTrigRef.dtype = actDt;
+        (nbaSelDest.left as HDLVarRef).dtype = nbaDt;
+        (nbaSelClear.left as HDLVarRef).dtype = nbaDt;
+        zeroIdx0.dtype = idxDt;
+        zeroIdx1.dtype = idxDt;
+        zeroIdx2.dtype = idxDt;
+        zeroIdx3.dtype = idxDt;
+        nbaSel.dtype = elemDt;
+        actSel.dtype = elemDt;
+        orVal.dtype = elemDt;
+        orInto.dtype = elemDt;
+        nbaSelDest.dtype = elemDt;
+        nbaSelClear.dtype = elemDt;
+        clearZero.dtype = elemDt;
+        clear.dtype = elemDt;
+      });
+      // Run nba body (with its own trigger guards intact, gating the work
+      // by which bits of __VnbaTriggered[0] are set).
+      evalNbaStmts = [
+        evalTriggersCall as unknown as HDLExpr,
+        orInto as unknown as HDLExpr,
+        ...nbaBodyNoVars,
+        clear as unknown as HDLExpr,
+      ];
     }
     // Synthesize V4-shaped top-level cfuncs out of the V5 region bodies.
     //   _eval_initial: ico body + stl body, plus any _eval_initial__TOP body.
@@ -383,23 +464,36 @@ export class VerilogXMLParser implements HDLUnit {
       ]),
     );
     mod.blocks.push(mkBlock('_eval_settle', [...hoistedVars, ...stlBodyNoVars]));
-    mod.blocks.push(
-      mkBlock('_eval', [...hoistedVars, ...stlBodyNoVars, ...evalNbaStmts, ...stlBodyNoVars]),
-    );
+    mod.blocks.push(mkBlock('_eval', [...hoistedVars, ...evalNbaStmts, ...stlBodyNoVars]));
     mod.blocks.push(mkBlock('_change_request', []));
   }
 
   /**
-   * Search the module's vardefs for the prev-clk tracker emitted by
-   * Verilator 5.x. Naming convention: `__Vtrigprevexpr___TOP__clk__N`.
+   * Find every prev-edge tracker Verilator 5.x emits for posedge-sensitive
+   * signals (clocks, async resets, vsync-driven counters, etc.) and pair
+   * each with the signal it tracks. Naming convention is
+   *   __Vtrigprevexpr___TOP__<signal>__<n>
+   * where <signal> may itself contain `.`s that name2js() has translated to
+   * `$`. We resolve the signal name by stripping the trailing __<n> suffix
+   * and the `__Vtrigprevexpr___TOP__` prefix.
    */
-  private findClkTriggerPrevVar(mod: HDLModuleDef): string | null {
-    for (const name of Object.keys(mod.vardefs)) {
-      if (name.startsWith('__Vtrigprevexpr_') && name.includes('clk')) {
-        return name;
-      }
+  private findTriggerPrevVars(mod: HDLModuleDef): Array<{ prevName: string; signalName: string }> {
+    const result: Array<{ prevName: string; signalName: string }> = [];
+    const prefix = '__Vtrigprevexpr___TOP__';
+    for (const prevName of Object.keys(mod.vardefs)) {
+      if (!prevName.startsWith(prefix)) continue;
+      const tail = prevName.slice(prefix.length);
+      // Strip the trailing __<n> suffix.
+      const m = /^(.*?)__\d+$/.exec(tail);
+      if (!m) continue;
+      // Verilator embeds `.` in qualified signal names as the literal `.`,
+      // and our name2js() converts that to `$`. So `tt_um_vga_example.vsync`
+      // becomes `tt_um_vga_example$vsync` — match that mangled form.
+      const signalName = this.name2js(m[1]);
+      if (!mod.vardefs[signalName]) continue;
+      result.push({ prevName, signalName });
     }
-    return null;
+    return result;
   }
 
   visit_var(node: XMLNode): HDLVariableDef {
@@ -527,10 +621,13 @@ export class VerilogXMLParser implements HDLUnit {
   }
 
   /**
-   * V5 cfuncs we drop unconditionally — pure scheduler/debug scaffolding.
-   * The bodies of `_eval_stl`, `_eval_ico`, `_eval_nba`, and the
-   * `_*_sequent__*` / `_*_comb__*` cfuncs are kept and consumed in
-   * finalizeV5Scheduler().
+   * V5 cfuncs we drop unconditionally — pure scheduler/debug scaffolding
+   * that we either don't need or replace with a synthesized equivalent.
+   * The bodies of `_eval_stl`, `_eval_ico`, `_eval_nba`, the
+   * `_*_sequent__*` / `_*_comb__*` cfuncs, AND the
+   * `_eval_triggers__*` / `_trigger_orInto__*` / `_trigger_clear__*`
+   * runtime helpers are kept — finalizeV5Scheduler() weaves them into a
+   * V4-shaped `_eval`.
    */
   private isV5SchedulerCfunc(name: string): boolean {
     if (name == null) return false;
@@ -542,11 +639,8 @@ export class VerilogXMLParser implements HDLUnit {
       name === '_eval' ||
       name === '_eval_debug_assertions' ||
       name.startsWith('_eval_phase__') ||
-      name.startsWith('_eval_triggers__') ||
       name.startsWith('_dump_triggers__') ||
-      name.startsWith('_trigger_anySet__') ||
-      name.startsWith('_trigger_orInto__') ||
-      name.startsWith('_trigger_clear__')
+      name.startsWith('_trigger_anySet__')
     );
   }
 
