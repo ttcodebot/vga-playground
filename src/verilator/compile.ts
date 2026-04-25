@@ -22,7 +22,7 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   const errorParser = new ErrorParser();
 
-  const verilatorInst = verilator_bin({
+  const verilatorInst = await verilator_bin({
     wasmBinary,
     noInitialRun: true,
     noExitRuntime: true,
@@ -32,7 +32,6 @@ export async function compileVerilator(opts: ICompileOptions) {
       errorParser.feedLine(message);
     },
   });
-  await verilatorInst.ready;
   const { FS } = verilatorInst;
 
   let sourceList: string[] = [];
