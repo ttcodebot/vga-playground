@@ -2281,6 +2281,12 @@ export class HDLModuleWASM implements HDLModuleRunner {
   _creset2wasm(e: HDLUnop, opts: Options) {
     if (isVarRef(e.left)) {
       var glob = this.globals.lookup(e.left.refname);
+      if (!glob) {
+        // V5 emits <creset> nodes for parameters of helper cfuncs we drop
+        // (the trigger/dump/etc. helpers). If the variable isn't a global
+        // there's nothing to reset.
+        return this.bmod.nop();
+      }
       // TODO: must be better way to tell non-randomize values
       // set clk and reset to known values so values are reset properly
       glob.reset = glob.name != 'clk' && glob.name != 'reset' && !glob.name.startsWith('__V');
