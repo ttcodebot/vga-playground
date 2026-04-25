@@ -259,8 +259,7 @@ export class VerilogXMLParser implements HDLUnit {
     const mod = this.cur_module;
     if (!mod) return;
     const blocks = mod.blocks;
-    // Collect blocks by name; some names (the sequent ones) are unique per
-    // generated body and there can be several.
+    // Collect blocks by name.
     const named = new Map<string, HDLBlock[]>();
     for (const b of blocks) {
       if (!b.name) continue;
@@ -268,19 +267,22 @@ export class VerilogXMLParser implements HDLUnit {
       list.push(b);
       named.set(b.name, list);
     }
-    const has = (n: string) => named.has(n);
-    // Heuristic: V5 always emits _eval_stl. If absent, the input is V4 (or a
-    // module so trivial Verilator emitted nothing) — leave the blocks alone.
+    // V5 emits per-region bodies in `_eval_stl`, `_eval_ico`, and
+    // `_eval_nba` — all wrapped in an `if (__V*Triggered[0] & 1)` guard. We
+    // strip the guard (so the inner code always runs) and use the bodies as
+    // the substance of our synthesized V4-style cfuncs. The standalone
+    // `_*_sequent__*` / `_*_comb__*` cfuncs may also be referenced via
+    // <ccall> from inside those bodies (older V5 outlining), so we keep
+    // them as callable functions.
     const stlBlocks = named.get('_eval_stl') ?? [];
-    const icoBlocks: HDLBlock[] = [];
-    const nbaBlocks: HDLBlock[] = [];
-    for (const b of blocks) {
-      if (b.name && b.name.startsWith('_ico_sequent__')) icoBlocks.push(b);
-      if (b.name && b.name.startsWith('_nba_sequent__')) nbaBlocks.push(b);
-    }
-    // Detect V5 by checking for any of the scheduler cfuncs (we know V4 had
-    // _eval_settle with the actual body, not as an empty marker).
-    const hasV5Scheduler = stlBlocks.length > 0 || icoBlocks.length > 0 || nbaBlocks.length > 0;
+    const icoBlocks = named.get('_eval_ico') ?? [];
+    const nbaBlocks = named.get('_eval_nba') ?? [];
+    const initialBlocks = named.get('_eval_initial__TOP') ?? [];
+    const hasV5Scheduler =
+      stlBlocks.length > 0 ||
+      icoBlocks.length > 0 ||
+      nbaBlocks.length > 0 ||
+      initialBlocks.length > 0;
     if (!hasV5Scheduler) {
       return; // Looks like V4 XML.
     }
@@ -289,50 +291,42 @@ export class VerilogXMLParser implements HDLUnit {
       name,
       exprs,
     });
-    // _eval_stl bodies are wrapped in `if (__VstlTriggered[0])`. We don't
-    // gate, we just always run the inner bodies — the simulator only invokes
-    // _eval_settle/_eval when something has changed, and the bodies are pure
-    // combinational assigns. Note `_eval_stl` may itself contain `<ccall>`s
-    // to outlined combo functions like `_ico_sequent__TOP__0`; we leave
-    // those callees defined as ordinary cfuncs.
     const stlBody = unwrapTriggerGate(stlBlocks);
-    // Build ccalls to the kept _nba_sequent__* cfuncs (rather than inlining
-    // their bodies) so that any local `<var>`s declared inside them stay
-    // properly scoped to those functions.
-    const nbaSequentCalls: HDLExpr[] = nbaBlocks.map(
-      (b) =>
-        ({
-          funcname: b.name,
-          dtype: null!,
-          args: [],
-        }) as HDLFuncCall,
-    );
-    // Same for _ico_sequent__* — call them at startup.
-    const icoSequentCalls: HDLExpr[] = icoBlocks.map(
-      (b) =>
-        ({
-          funcname: b.name,
-          dtype: null!,
-          args: [],
-        }) as HDLFuncCall,
-    );
-    // Drop only `_eval_stl` itself — its body has been hoisted into our
-    // synthesized cfuncs. `_ico_sequent__*` and `_nba_sequent__*` stay as
-    // callable functions referenced by ccalls in the inlined body.
-    const consumed = new Set<string>(['_eval_stl']);
+    const icoBody = unwrapTriggerGate(icoBlocks);
+    const nbaBody = unwrapTriggerGate(nbaBlocks);
+    const initialBody = initialBlocks.flatMap((b) => b.exprs);
+    // Now that we've harvested their bodies, drop the V5 region cfuncs from
+    // mod.blocks. The `_*_sequent__*` / `_*_comb__*` cfuncs remain so any
+    // <ccall>s from the harvested bodies still resolve.
+    const consumed = new Set<string>(['_eval_stl', '_eval_ico', '_eval_nba', '_eval_initial__TOP']);
     mod.blocks = blocks.filter((b) => !b.name || !consumed.has(b.name));
-    // Posedge-clk gate: V5 wires _nba_sequent__* through __VnbaTriggered, which
-    // is set when `clk && !__Vtrigprevexpr_clk`. Reproduce that here so we
-    // execute non-blocking assigns on the rising edge of clk only. If the
-    // design has no clk, the trigger var is absent and we just always execute
-    // the nba bodies (no-op for pure combo).
-    //
-    // dtype lookups against vardefs are still pending at this point (they
-    // run via `defer()` after parsing). Defer the gate construction so the
-    // synthesized varrefs see the real types.
+    // Hoist any <var> declarations that live at the top of the harvested
+    // bodies so they remain at the top level of our synthesized cfuncs.
+    // genFunction only scans block.exprs for var decls (no recursion), so
+    // burying them inside our synthesized posedge-clk <if> would prevent
+    // them from being allocated. Note: the harvested bodies may share
+    // identical <var> objects across stl/nba etc. — dedupe by name.
+    const hoistedVarsMap = new Map<string, HDLExpr>();
+    const splitVars = (body: HDLExpr[]): HDLExpr[] => {
+      const rest: HDLExpr[] = [];
+      for (const stmt of body) {
+        if (stmt && isVarDecl(stmt as any)) {
+          const v = stmt as HDLVariableDef;
+          if (!hoistedVarsMap.has(v.name)) hoistedVarsMap.set(v.name, stmt);
+        } else {
+          rest.push(stmt);
+        }
+      }
+      return rest;
+    };
+    const stlBodyNoVars = splitVars(stlBody);
+    const icoBodyNoVars = splitVars(icoBody);
+    const nbaBodyNoVars = splitVars(nbaBody);
+    const initialBodyNoVars = splitVars(initialBody);
+    const hoistedVars = Array.from(hoistedVarsMap.values());
     const clkPrev = this.findClkTriggerPrevVar(mod);
-    let evalNbaStmts: HDLExpr[] = nbaSequentCalls;
-    if (nbaSequentCalls.length > 0 && clkPrev) {
+    let evalNbaStmts: HDLExpr[] = nbaBodyNoVars;
+    if (nbaBodyNoVars.length > 0 && clkPrev) {
       // Placeholders we'll mutate via defer().
       const clkRef: HDLVarRef = { refname: 'clk', dtype: null! };
       const prevRef: HDLVarRef = { refname: clkPrev, dtype: null! };
@@ -359,7 +353,7 @@ export class VerilogXMLParser implements HDLUnit {
         op: 'if',
         dtype: null!,
         cond,
-        left: mkBlock(null!, [...nbaSequentCalls]),
+        left: mkBlock(null!, [...nbaBodyNoVars]),
         right: null!,
       };
       // Update the prev tracker UNCONDITIONALLY at the end (after firing the
@@ -369,23 +363,29 @@ export class VerilogXMLParser implements HDLUnit {
       // subsequent rising edge (after a fall) would never re-fire.
       evalNbaStmts = [ifBlock as unknown as HDLExpr, updatePrev as unknown as HDLExpr];
     }
-    // _eval_initial: combo settle on the very first call (so outputs reflect
-    // input values before clocks tick). _eval_settle: also combo. _eval:
-    // combo + posedge nba + combo (so flop outputs propagate combinationally
-    // before the next eval).
-    // We always synthesize V4-shaped top-level cfuncs for V5 inputs, even if
-    // `_eval_initial`/etc. existed in the V5 XML — the V5 versions reference
-    // scheduler bookkeeping we've torn out.
-    mod.blocks = mod.blocks.filter(
-      (b) =>
-        b.name !== '_eval_initial' &&
-        b.name !== '_eval_settle' &&
-        b.name !== '_eval' &&
-        b.name !== '_change_request',
+    // Synthesize V4-shaped top-level cfuncs out of the V5 region bodies.
+    //   _eval_initial: ico body + stl body, plus any _eval_initial__TOP body.
+    //                  This propagates initial-converge and combo settle so
+    //                  outputs are stable before the first clock edge.
+    //   _eval_settle:  stl body alone.
+    //   _eval:         stl + posedge-clk-gated nba + stl. The trailing stl
+    //                  ensures NBA flop outputs propagate combinationally
+    //                  before this eval returns (otherwise simulation would
+    //                  need an extra round-trip to settle).
+    //   _change_request: returns 0 — V5's flat scheduling means we never
+    //                  need an iterative settle loop in the wrapper.
+    mod.blocks.push(
+      mkBlock('_eval_initial', [
+        ...hoistedVars,
+        ...initialBodyNoVars,
+        ...icoBodyNoVars,
+        ...stlBodyNoVars,
+      ]),
     );
-    mod.blocks.push(mkBlock('_eval_initial', [...icoSequentCalls, ...stlBody]));
-    mod.blocks.push(mkBlock('_eval_settle', [...stlBody]));
-    mod.blocks.push(mkBlock('_eval', [...stlBody, ...evalNbaStmts, ...stlBody]));
+    mod.blocks.push(mkBlock('_eval_settle', [...hoistedVars, ...stlBodyNoVars]));
+    mod.blocks.push(
+      mkBlock('_eval', [...hoistedVars, ...stlBodyNoVars, ...evalNbaStmts, ...stlBodyNoVars]),
+    );
     mod.blocks.push(mkBlock('_change_request', []));
   }
 
@@ -527,9 +527,10 @@ export class VerilogXMLParser implements HDLUnit {
   }
 
   /**
-   * V5 cfuncs we drop unconditionally. The "real" combinational and
-   * non-blocking-assignment bodies live in `_eval_stl`, `_ico_sequent__*`,
-   * and `_nba_sequent__*` — those we keep.
+   * V5 cfuncs we drop unconditionally — pure scheduler/debug scaffolding.
+   * The bodies of `_eval_stl`, `_eval_ico`, `_eval_nba`, and the
+   * `_*_sequent__*` / `_*_comb__*` cfuncs are kept and consumed in
+   * finalizeV5Scheduler().
    */
   private isV5SchedulerCfunc(name: string): boolean {
     if (name == null) return false;
@@ -538,8 +539,6 @@ export class VerilogXMLParser implements HDLUnit {
       name === '_eval_initial' ||
       name === '_eval_final' ||
       name === '_eval_settle' ||
-      name === '_eval_ico' ||
-      name === '_eval_nba' ||
       name === '_eval' ||
       name === '_eval_debug_assertions' ||
       name.startsWith('_eval_phase__') ||
