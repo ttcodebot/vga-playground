@@ -22,6 +22,7 @@ import {
   isVarRef,
   isWhileop,
 } from './hdltypes';
+import { parseMemFile } from './readmem';
 import { byteArrayToString, safeExtend } from './util';
 
 interface VerilatorUnit {
@@ -426,16 +427,14 @@ export class HDLModuleJS implements HDLModuleRunner {
     // parse hex/binary file
     var strdata = this.getFileData!(strfn) as string;
     if (strdata == null) throw new HDLError(null, "Could not $readmem '" + strfn + "'");
-    var data = strdata
-      .split('\n')
-      .filter((s) => s !== '')
-      .map((s) => parseInt(s, ishex ? 16 : 2));
-    console.log('$readmem', ishex, strfn, data.length);
+    var entries = parseMemFile(strdata, !!ishex);
     // copy into destination array
     if (memp === null) throw new HDLError(null, 'No destination array to $readmem ' + strfn);
-    if (memp.length < data.length)
-      throw new HDLError(null, 'Destination array too small to $readmem ' + strfn);
-    for (i = 0; i < data.length; i++) memp[i] = data[i];
+    for (const { addr, value } of entries) {
+      if (addr >= memp.length)
+        throw new HDLError(null, 'Destination array too small to $readmem ' + strfn);
+      memp[addr] = value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
+    }
   }
 
   $time(o: any) {
